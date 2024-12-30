@@ -1,0 +1,540 @@
+---
+title: "Tarea 1"
+author: "Javier Méndez Parrilla"
+date: "2024-11-19"
+output: html_document
+---
+
+```{r inicialización, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(pROC)
+library(h2o)
+library(uuid)
+library(caret)
+library(glmnet)
+```
+
+Sin incidencias en la instalación de los paquetes, simplemente hubo que prolongar el timeout al instalar el paquete **h2o** para que diera suficiente tiempo a descargarlo, ya que es pesado y 60 segundos eran insuficientes en mi caso.
+
+## Requires a logical vector of true label and a vector of predictions. Computes several classification measures from the true label and the predictions obtained from a classifier fitted to the data. Returns accuracy and auc
+
+```{r}
+get.classification.measures <- function(true.class, pred.probs) {
+     
+     true.class <- as.numeric(true.class) # convert FALSE/TRUE to 0/1
+     pred.class <- as.numeric(pred.probs > 0.5)
+     
+     cases.idx         <- which(true.class == 1)
+     controls.idx      <- which(true.class == 0)
+     
+     res <- data.frame("accuracy"=0)
+     
+     # Accuracy
+     res$accuracy <- sum(true.class == pred.class) / length(true.class)
+     
+     # Area under the Receiver-Operator Curve and Confidence Intervals
+     res$AUC <- as.numeric(pROC::auc(response = true.class, predictor = pred.probs))
+     
+     return(unlist(res))
+}
+```
+
+Esta función tiene por objetivo calcular las métricas de rendimiento del modelo empleado, en nuestro caso utilizamos el **accuracy** y el valor **AUC de la curva ROC**, para tratar esto adecuadamente nos aseguramos de convertir las clases en el formato numérico que necesitamos para nuestro cálculo, y establecemos el umbral de una probablididad superior a 0.5 para clasificar una instancia como positiva.
+
+
+## It fits a deep net to data, performing a model selection internally through a random search
+
+```{r}
+deepnet.training <- function(x, y, inner.folds) {
+     y <- plyr::revalue(factor(y), c("0"="no", "1"="yes"))
+     
+     my.uuid <- gsub("-", "", UUIDgenerate())
+     
+     #split train in 80% train and 20% validation
+     train.ids = sort(sample(1:nrow(x), size = floor(nrow(x)*0.8)))
+     val.ids   = setdiff(1:nrow(x), train.ids)
+     
+     X.train = x[train.ids,]
+     X.val   = x[val.ids,]
+     Y.train = y[train.ids]
+     Y.val   = y[val.ids]
+     
+     data.train <- cbind(outcome=Y.train, as.data.frame(X.train))
+     data.train <- h2o::as.h2o(data.train, paste0("data.train.",my.uuid))
+     data.val   <- cbind(outcome=Y.val, as.data.frame(X.val))
+     data.val   <- h2o::as.h2o(data.val, paste0("data.val.",my.uuid))
+     
+     #deepnet parameters to try
+     rand_activation     <- RAND.ACTIVATION
+     rand_rho            <- seq(0.9, 0.99, 1e-3)
+     rand_epsilon        <- c(1e-10,1e-9,1e-8,1e-7,1e-6,1e-5,1e-4)
+     rand_input_dropout  <- seq(RAND.MIN.INPUT.DROPOUT, RAND.MAX.INPUT.DROPOUT, 1e-4)
+     rand_l1             <- seq(RAND.MIN.L1, RAND.MAX.L1, 3e-4)
+     rand_l2             <- seq(RAND.MIN.L2, RAND.MAX.L2, 3e-4)
+     
+     RAND.MAX.NEURONS.PER.LAYER = min(RAND.MAX.NEURONS.PER.LAYER, ncol(x))
+     MAX.RUNTIME.SECS = MAX.RUNTIME.SECS/(RAND.MAX.NUM.HIDDEN.LAYERS-RAND.MIN.NUM.HIDDEN.LAYERS+1)
+     bestgrids = list()
+     for (netsize in RAND.MIN.NUM.HIDDEN.LAYERS:RAND.MAX.NUM.HIDDEN.LAYERS) {
+          rand_hidden         <- lapply(lapply(1:500,
+                                               function(x) RAND.MIN.NEURONS.PER.LAYER+sample(RAND.MAX.NEURONS.PER.LAYER-RAND.MIN.NEURONS.PER.LAYER, netsize, replace=F)),
+                                        function(x) sort(x, decreasing = T))
+          rand_hidden_dropout <- lapply(lapply(1:500,
+                                               function (x) sample(seq(RAND.MIN.HIDDEN.DROPOUT, RAND.MAX.HIDDEN.DROPOUT, 1e-4), netsize, replace = F)),
+                                        function(x) sort(x, decreasing = T))
+          
+          hyper_params <- list(activation = rand_activation, rho = rand_rho, epsilon = rand_epsilon,
+                               hidden = rand_hidden, input_dropout_ratio = rand_input_dropout, hidden_dropout_ratios = rand_hidden_dropout,
+                               l1 = rand_l1, l2 = rand_l2)
+          search_criteria = list(strategy = "RandomDiscrete",
+                                 max_models = NUM.RANDOM.TRIALS, max_runtime_secs = MAX.RUNTIME.SECS,
+                                 seed=123456)
+          
+          model_grid <- h2o.grid("deeplearning",
+                                 grid_id = paste0("gridsize.",netsize,".",my.uuid),
+                                 hyper_params = hyper_params,
+                                 search_criteria = search_criteria,
+                                 x = colnames(x),
+                                 y = "outcome",
+                                 training_frame = data.train,
+                                 validation_frame = data.val,
+                                 balance_classes = T,
+                                 epochs = TRIAL.EPOCHS,
+                                 stopping_rounds = 3,
+                                 stopping_tolerance = 0.02,
+                                 stopping_metric = "AUC")
+          
+          aucs.train.perf = c()
+          aucs.val.perf   = c()
+          for (mi in model_grid@model_ids) {
+               aucs.train.perf = c(aucs.train.perf, h2o.auc(h2o.getModel(mi)))
+               aucs.val.perf   = c(aucs.val.perf, h2o.auc(h2o.getModel(mi), valid = T))
+          }
+          
+          #
+          bestgrids[[paste0("size",netsize)]] = h2o.getModel(model_grid@model_ids[[which.max(aucs.val.perf)]])
+     }
+     
+     #grab best deepnet and use its parameter to fit a final deepnet to the complete train set
+     best.uuid <- gsub("-", "", UUIDgenerate())
+     best.model.tried = bestgrids[[which.max(sapply(bestgrids, function(x) h2o.auc(x, valid = T)))]]
+     
+     data <- cbind(outcome=y, as.data.frame(x))
+     data <- h2o::as.h2o(data, paste0("data.",best.uuid))
+     
+     model <- h2o.deeplearning(x=colnames(x), y="outcome",
+                               training_frame = data, model_id = paste0("bestmodel.",best.uuid),
+                               activation = best.model.tried@parameters$activation,
+                               hidden = best.model.tried@parameters$hidden,
+                               epochs = EPOCHS,
+                               rho = best.model.tried@parameters$rho,
+                               epsilon = best.model.tried@parameters$epsilon,
+                               input_dropout_ratio = best.model.tried@parameters$input_dropout_ratio,
+                               hidden_dropout_ratios = best.model.tried@parameters$hidden_dropout_ratios,
+                               l1 = best.model.tried@parameters$l1,
+                               l2 = best.model.tried@parameters$l2,
+                               stopping_rounds = 3,
+                               stopping_tolerance = 0.02,
+                               stopping_metric = "AUC",
+                               balance_classes = T,
+                               export_weights_and_biases = T
+     )
+     
+     return(list(id=model@model_id, deepnet=model,
+                 parameters=unlist(model@allparameters[c("activation","rho","epsilon","hidden","epochs","input_dropout_ratio","hidden_dropout_ratios","l1","l2")])))
+}
+```
+
+**Descripción del Método `deepnet.training`**
+
+El método `deepnet.training` entrena un modelo de **red neuronal profunda** utilizando el framework de aprendizaje automático `h2o`. Su objetivo principal es encontrar la mejor configuración de parámetros para maximizar el rendimiento en una tarea de clasificación binaria (por ejemplo, distinguir entre "sí" y "no").
+
+---
+
+### **Flujo de Trabajo:**
+
+1. **División de Datos**:
+   - Separa los datos originales en:
+     - **Conjunto de entrenamiento** (80%): Para ajustar los parámetros del modelo.
+     - **Conjunto de validación** (20%): Para evaluar diferentes configuraciones y evitar el sobreajuste.
+
+2. **Preparación para H2O**:
+   - Convierte los datos a un formato compatible con `h2o`, necesario para usar las funciones de entrenamiento.
+
+3. **Búsqueda de Hiperparámetros**:
+   - Explora combinaciones de configuraciones de la red neuronal, tales como:
+     - Número de capas ocultas y neuronas.
+     - Funciones de activación.
+     - Parámetros de regularización (L1, L2).
+     - Tasa de *dropout* para prevenir el sobreajuste.
+   - Utiliza una **búsqueda aleatoria** para seleccionar estas combinaciones de manera eficiente dentro de un tiempo o número de modelos limitado.
+
+4. **Evaluación**:
+   - Entrena múltiples redes neuronales y calcula su rendimiento (medido con AUC) en el conjunto de validación.
+   - Selecciona el modelo con el mejor rendimiento en validación.
+
+5. **Entrenamiento Final**:
+   - Usa todos los datos disponibles (entrenamiento + validación) para ajustar un modelo definitivo con los parámetros óptimos.
+
+6. **Salida**:
+   - Devuelve:
+     - El modelo entrenado.
+     - Los hiperparámetros óptimos.
+     - La identificación del modelo.
+
+---
+
+### **Puntos Clave**
+
+- **Optimización Automática**: El método encuentra la mejor configuración para la red neuronal mediante una búsqueda eficiente de parámetros.
+- **Uso de Métricas**: Se enfoca en maximizar el AUC, una métrica clave en problemas de clasificación binaria.
+- **Generalización**: La separación entre entrenamiento y validación asegura que el modelo no se adapte excesivamente a los datos de entrenamiento.
+
+---
+
+
+## It computes predictions of newdata using a deepnet
+
+Esta función se emplea para evaluar la red entrenada.
+
+```{r}
+deepnet.predictions <- function(model, x) {
+     my.uuid     <- gsub("-", "", UUIDgenerate())
+     newdata.hex <- h2o::as.h2o(as.data.frame(x), paste0("newdata.",my.uuid))
+     predictions <- as.numeric(as.matrix(predict(model$deepnet, newdata = newdata.hex)[,"yes"]))
+     h2o::h2o.rm(paste0("newdata.",my.uuid))
+     gc()
+     
+     if (any(predictions<0)) stop("Negative probabilities predicted... Check the configuration of the trained deepnet")
+          
+     return(predictions)
+}
+```
+
+**Descripción del Método `deepnet.predictions`**
+
+La función `deepnet.predictions` genera predicciones de probabilidades utilizando un modelo de red neuronal profunda previamente entrenado (almacenado en `model`) sobre un nuevo conjunto de datos (`x`).
+
+---
+
+### **Flujo de Trabajo**
+
+1. **Conversión de Datos**:
+   - Convierte los nuevos datos (`x`) en un formato compatible con `h2o` (denominado *hex frame*).
+   - Se utiliza un identificador único (`UUID`) para evitar conflictos en la memoria de `h2o`.
+
+2. **Predicción**:
+   - Utiliza el modelo entrenado (`model$deepnet`) para calcular las probabilidades de la clase "sí" (o "positiva") para cada instancia del conjunto de datos.
+   - Las predicciones se convierten a una matriz numérica para facilidad de uso.
+
+3. **Validación**:
+   - Comprueba si las probabilidades predichas son negativas (lo cual sería un error en la configuración del modelo).
+
+4. **Limpieza**:
+   - Elimina los datos temporales creados en la memoria de `h2o`.
+   - Libera memoria adicional con `gc()` para evitar saturación del sistema.
+
+5. **Salida**:
+   - Devuelve un vector con las probabilidades de la clase "sí" para cada instancia del conjunto de datos.
+
+---
+
+### **Puntos Clave**
+
+- **Predicción Probabilística**: La función no solo clasifica, sino que devuelve la probabilidad de pertenecer a la clase positiva.
+- **Seguridad**: Implementa una validación para asegurar que los resultados sean válidos (sin valores negativos).
+- **Gestión de Memoria**: Se asegura de limpiar la memoria después de realizar las predicciones, previniendo posibles problemas de rendimiento.
+
+---
+
+En resumen, `deepnet.predictions` aplica un modelo entrenado a nuevos datos y devuelve probabilidades precisas para cada observación, garantizando la eficiencia y validez de los resultados.
+
+
+
+## x is the expression level of an individual gene and y is the class label
+
+```{r}
+univar.ttest <- function(x, y) {
+     controls = x[y==0]
+     cases = x[y==1]
+     
+     return(t.test(controls, cases)$p.value)
+}
+```
+
+**Descripción del Método `univar.ttest`**
+
+La función `univar.ttest` realiza una prueba t de dos muestras independientes para comparar dos grupos (casos y controles) y devuelve el valor p de la prueba.
+
+---
+
+### **Flujo de Trabajo **
+
+1. **División de los Datos**:
+   - La función separa los datos en dos grupos según los valores en el vector `y`:
+     - **Controles**: Los valores en `x` correspondientes a las instancias donde `y == 0`.
+     - **Casos**: Los valores en `x` correspondientes a las instancias donde `y == 1`.
+
+2. **Aplicación de la Prueba t**:
+   - Realiza una prueba t de Student para comparar las medias de ambos grupos (`controls` y `cases`).
+   - La función `t.test` devuelve varios resultados, pero solo se extrae el **valor p**.
+
+3. **Salida**:
+   - La función devuelve el valor p de la prueba t, que indica si hay una diferencia estadísticamente significativa entre los dos grupos.
+
+---
+
+### **Puntos Clave**
+
+- **Prueba t de Student**: Se utiliza para comparar si dos grupos independientes tienen medias significativamente diferentes.
+- **Valor p**: El valor p es una medida de la evidencia en contra de la hipótesis nula (que dice que no hay diferencia entre los grupos). Si el valor p es menor que un umbral (por ejemplo, 0.05), se puede rechazar la hipótesis nula.
+
+---
+
+En resumen, `univar.ttest` realiza una prueba t de Student entre dos grupos de datos (casos y controles) y devuelve el valor p, que indica si las diferencias entre los grupos son estadísticamente significativas.
+
+
+
+## Performs a univariate t-test to get a p-value per gene. Then, performs a correlation test to discard highly correlated genes until less than "max.vars" are retained
+
+En esta función se emplea el estadístico t de Student para seleccionar características y reducir la dimensionalidad de los patrones (generalmente en torno al 20 %).
+
+```{r}
+ttest.feature.reduction <- function(myX, myY, pval.thres = 0.05, max.vars = 200) {
+     pvals = apply(myX, 2, function(x, y) univar.ttest(x,y), myY)
+     
+     myX = myX[, pvals < pval.thres]
+     
+     cutoff = 0.95
+     while (ncol(myX)>max.vars) {
+          cormatrix = stats::cor(as.matrix(myX))
+          hc = findCorrelation(abs(cormatrix), cutoff=cutoff) # putt any value as a "cutoff"
+          if (length(hc)>0){
+               hc = sort(hc)
+               myX = myX[,-c(hc)]
+          }
+          cutoff = cutoff-0.05
+     }
+     
+     return(colnames(myX))
+}
+```
+**Descripción del Método `ttest.feature.reduction`**
+
+La función `ttest.feature.reduction` realiza una selección de características (features) en función de una prueba t y correlación, con el objetivo de reducir la dimensionalidad de los datos eliminando las características menos relevantes.
+
+---
+
+### **Flujo de Trabajo**
+
+1. **Cálculo de Valores p para las Características**:
+   - La función comienza aplicando la prueba t de Student (`univar.ttest`) a cada columna de `myX` (las características) con respecto al vector `myY` (las etiquetas).
+   - Los valores p resultantes indican qué tan significativa es cada característica con respecto a las clases.
+
+2. **Filtrado por Valor p**:
+   - Las características cuyo valor p es mayor que el umbral `pval.thres` (por defecto, 0.05) son eliminadas. Esto asegura que solo las características con diferencias significativas entre los grupos sean retenidas.
+
+3. **Reducción por Correlación**:
+   - Después de la selección inicial, la función entra en un bucle en el que busca eliminar las características altamente correlacionadas entre sí.
+   - Se calcula una matriz de correlación de las características restantes, y aquellas que tienen una correlación superior a un valor de corte (`cutoff`), se eliminan.
+   - El umbral de correlación se reduce progresivamente de 0.95 a 0.05 hasta que el número de características se ajusta al límite especificado por `max.vars` (por defecto, 200).
+
+4. **Salida**:
+   - Finalmente, la función devuelve los nombres de las características seleccionadas, que son las que cumplen con ambos criterios: baja correlación y valor p significativo.
+
+---
+
+### **Puntos Clave**
+
+- **Selección por Valor p**: Se utiliza la prueba t para identificar características que muestran diferencias significativas entre las clases (por ejemplo, entre casos y controles).
+- **Reducción por Correlación**: La función elimina características que están altamente correlacionadas entre sí, lo que puede reducir la redundancia y mejorar el rendimiento de los modelos.
+- **Corte de Características**: Si el número de características es mayor que el umbral `max.vars`, la función ajusta la selección de características reduciendo la correlación entre ellas.
+
+---
+
+En resumen, `ttest.feature.reduction` realiza una selección de características basada en la prueba t para evaluar la relevancia de cada característica, y luego aplica un proceso de eliminación de características altamente correlacionadas para reducir la dimensionalidad de los datos a un conjunto manejable de variables relevantes.
+
+## Programa principal
+
+Este es el código del programa principal. Leemos el conjunto de datos desde el RData, obtenemos los patrones y la salida deseada y comenzamos el entrenamiento.
+
+Se inicializa un conjunto de variables globales que se emplearán para el ajuste de los parámetros de la red.
+
+**Prueba a modificar algunos de los parámetros tras haber ejecutado el código original y responde a las preguntas:**
+
+-   ¿Qué cambios has hecho? ¿Por qué?
+
+    He eliminado la función de activación "TanhWithDropout" tras la primera ejecución, ya que ninguno de los modelos obtenidos como los mejores lo ha empleado, por lo que reduciremos tiempo y capacidad de computación si no tenemos que elaborar modelos con este método aparentemente ineficiente, mantendremos el rectificador y también el método maxout, ambos con dropout.
+    Ninguno de los modelos obtenidos en una repetición tienen mas de 3 capas ocultas, por lo que reduje el maximo de 4 a 3, también usar un maximo de 200 neuronas por capa me pareció un exceso, ya que los modelos con muchas neuronas suelen tender a un sobreajuste (todos los modelos obtenidos a excepción de 2 están claramente sobreajustados, mostrando diferencias superiores al 10-12% entre el valor de métricas durante el entrenamiento y test) y lo cambié a 100.
+    También he cambiado el numero de epochs de 2000 a 1000 para tratar de  prevenir el overfitting ya que entrenar durante demasiadas épocas puede hacer que el modelo se ajuste demasiado a los datos de entrenamiento, perdiendo capacidad de generalización para datos nuevos y también disminuye el tiempo total de ejecución.
+    Otros parámetros modificados:
+     - RAND.MAX.INPUT.DROPOUT a 0.3  para mejorar la regularización al permitir más variabilidad en las entradas.
+     - RAND.MAX.L1 y L2 a 0.3  para regularización L1 más agresiva
+     En todos los casos al elaborar el array de valores a probar he aumentado proporcionalmente el valor de paso, para obtener valores más variados siendo mas restrictivos sin comprometer en exceso el numero de parametros a probar.
+    
+-   ¿Te ha surgido algún problema durante la ejecución del código?¿Cuál?¿Cómo lo has resuelto?
+    
+    No en cuanto a errores de ejecución del código, lo que si me ha pasado, imagino que como al resto de compañeros es que el tiempo de ejecución es alto y requiere bastantes recursos del ordenador, pese a haber tratado de optimizar en la medida de lo que se me ha ocurrido el flujo de trabajo. He obtenido algunos warnings debido a algunas combinaciones de hiperparámetros no apropiadas para entrenar un modelo y también a la hora de descargar "h2o" he tenido que modificar el parámetro "timeout" para aumentar el tiempo de la ventana de descarga, ya que era imposible descargarlo en mi máquina en el tiempo preestablecido.
+    
+    También dejé el programa ejecutándose durante prácticamente un dia entero para obtener los resultados finales, y una vez obtenidos me fijé que no había escrito las métricas asociadas a los modelos en lasso en el csv, simplemente las mostré por pantalla. Igualmente, en su debido apartado he hecho un comentario sobre los rsultados que he visualizado.
+    
+    
+  
+    
+    
+-   ¿Has obtenido resultados significativamente distintos (acc, auc)?
+    
+    Tras modificar los parámetros como se ha explicado anteriormente, he observado una mejora generalizada en el acc.test y auc.test, aunque no he conseguido corregir las diferencias entre los altos valores obtenidos en las métricas de entrenamiento (acc.train y auc.train) respecto a las de test, por lo que aunque los valores de test son considereablemente mejores a los iniciales, si es claro que la mayoría de modelos obtenidos tienden a sobreajustar. La complejidad del programa en cuanto a recursos y tiempo de ejecución, he de decir, que ha limitado considerablemente mi capacidad para probar diferentes combinaciones de hiperparámetros.
+
+**Opcional: con el paquete glmnet, incluye en el bucle el entrenamiento de un modelo de regressión con LASSO y evalúalo (debes haberlo hecho en Minería de datos):**
+
+-   Compara los resultados obtenidos con LASSO con los que produce la red de aprendizaje profundo. ¿Es LASSO competitivo?¿Merece la pena el mayor tiempo de entrenamiento dedicado a la red?
+
+    Según los resultados obtenidos, en los que he comparado ambos tipos de modelos basandome en la métrica del AUC, LASSO me ha proporcionado resultados similares o incluso mejores dedicando menos tiempo a la creación y validación del modelo, por lo que el incremento experimentado aparentemente merece la pena en base a los resultados observables, aunque en ningún caso han llegado a mejorar el mejor modelo obtenido con deepnet.
+
+```{r}
+DATABASE = "KIPAN"
+REP.INIT = 1 #starting repetition id for several repetitions of 10-fold-CV
+REP.END  = 3 #ending repetition id for several repetitions of 10-fold-CV
+
+DATASET.FILE     = "KIPAN__illuminahiseq_rnaseqv2__Level_3__RSEM_genes_normalized.data.RData"
+SAVE.RDATA.FILE  = paste0("ttestcor-deepnet_rep_", REP.INIT, "_", REP.END, ".RData")
+SAVE.CSV.FILE    = paste0("ttestcor-deepnet_rep_", REP.INIT, "_", REP.END, ".csv")
+
+#Filtering parameters
+PVAL.THRES = 0.001
+MAX.VARS = 270
+
+#DeepNets parameters
+NUM.RANDOM.TRIALS = 500
+MAX.RUNTIME.SECS = 600  # per fold, maximum spend 10 minutes trying different deepnets to select the best one => 100 minutes to run 10-fold-CV
+TRIAL.EPOCHS = 100
+EPOCHS = 1000
+RAND.ACTIVATION = c("RectifierWithDropout","MaxoutWithDropout")
+RAND.MIN.NUM.HIDDEN.LAYERS  = 2
+RAND.MAX.NUM.HIDDEN.LAYERS  = 3
+RAND.MIN.NEURONS.PER.LAYER  = 10
+RAND.MAX.NEURONS.PER.LAYER  = 100
+RAND.MIN.INPUT.DROPOUT      = 1e-3
+RAND.MAX.INPUT.DROPOUT      = 0.3  # Mejora la regularización al permitir más variabilidad en las entradas
+RAND.MIN.HIDDEN.DROPOUT     = 1e-3
+RAND.MAX.HIDDEN.DROPOUT     = 0.1
+RAND.MIN.L1                 = 1e-3
+RAND.MAX.L1                 = 0.3  # Ampliado para regularización L1 más agresiva
+RAND.MIN.L2                 = 1e-3
+RAND.MAX.L2                 = 0.3
+
+#cargamos los datos
+load(DATASET.FILE)
+
+set.seed(1234)
+
+# Number of observations
+N = nrow(datainfo$data)
+# Number of predictors
+P = (ncol(datainfo$data)-1)
+
+num.samples <- N
+print(paste("#samples:", num.samples))
+print(paste("#variables:", P))
+
+X = datainfo$data[,-1]
+y = datainfo$data[,1]
+
+#normalize the data
+#to avoid problems with memory, the normalization is make in two steps
+X[,1:floor(P/2)] <- scale(X[,1:floor(P/2)])
+X[,(floor(P/2)+1):P] <- scale(X[,(floor(P/2)+1):P])
+
+simul <- NULL
+perfs.mat <- matrix(NA, nrow=10*((REP.END-REP.INIT)+1), ncol=5)
+colnames(perfs.mat) <- c("repetition","acc.train","auc.train","acc.test","auc.test")
+right.row=1
+# loop over several repetitions of cross-validation
+for (rep in seq(REP.INIT, REP.END)) {
+     cat(paste0("Repetition ", rep, "\n\n"))
+     
+     #the following line obtains the folds for 10-fold CV;
+     folds <- datainfo$folds[datainfo$folds[,1]==rep, 2:ncol(datainfo$folds)]
+     
+     num.outter.folds <- ncol(folds)
+     iter.res = NULL
+     start.time = Sys.time()
+     #loop over different folds
+for (ff in 1:num.outter.folds) {
+    cat(paste0("CV ", ff, "-fold\n"))
+
+    # Obtener conjuntos de entrenamiento y prueba
+    train.ids   <- which(folds[, ff] != -1)
+    test.ids    <- which(folds[, ff] == -1)
+    X.train     <- X[train.ids,]
+    X.test      <- X[test.ids,]
+    Y.train     <- y[train.ids]
+    Y.test      <- y[test.ids]
+
+    # Selección de características con t-test
+    retained.features <- ttest.feature.reduction(X.train, Y.train, pval.thres = PVAL.THRES, max.vars = MAX.VARS)
+    X.train <- X.train[, retained.features, drop=FALSE]
+    X.test  <- X.test[, retained.features, drop=FALSE]
+
+    ########################################################################################
+    ## Entrenamiento de LASSO
+    cat("Entrenando LASSO...\n")
+    cv.lasso <- cv.glmnet(x = as.matrix(X.train), y = as.factor(Y.train), 
+                          family = "binomial", alpha = 1, nfolds = 5)
+    best.lambda <- cv.lasso$lambda.min
+    lasso.model <- glmnet(x = as.matrix(X.train), y = as.factor(Y.train), 
+                          family = "binomial", alpha = 1, lambda = best.lambda)
+
+    # Predicciones con LASSO
+    lasso.train.pred <- predict(lasso.model, newx = as.matrix(X.train), type = "response")
+    lasso.test.pred  <- predict(lasso.model, newx = as.matrix(X.test), type = "response")
+
+    # Evaluación de LASSO
+    lasso.train.auc <- get.classification.measures(true.class = Y.train, pred.probs = lasso.train.pred)
+    lasso.test.auc  <- get.classification.measures(true.class = Y.test, pred.probs = lasso.test.pred)
+    cat("LASSO - AUC Train:", lasso.train.auc["AUC"], "Test:", lasso.test.auc["AUC"], "\n")
+
+    ########################################################################################
+    ## Entrenamiento de DeepNet (sin cambios en el flujo existente)
+   h2o.init()
+          Sys.sleep(2)
+
+          model <- deepnet.training(x=X.train, y=Y.train, inner.folds=inner.folds)
+          print(model$parameters)
+
+          ########################################################################################
+
+          #number of optimal predictors selected by lasso
+          iter.res[[paste0("cvfold",ff)]][["retained.predictors"]] <- retained.features
+          iter.res[[paste0("cvfold",ff)]][["deepnet.parameters"]]  <- model$parameters
+
+          #compute train predictions over the train set, removing the outcome since we don't know it
+          train.predictions <- deepnet.predictions(model = model, x = X.train)
+          #compute test predictions over the test set, removing the outcome since we don't know it
+          test.predictions <- deepnet.predictions(model = model, x = X.test)
+
+
+          #compute classification measures within this test-fold
+          train.auc <- get.classification.measures(true.class = Y.train, pred.probs = train.predictions)
+          test.auc  <- get.classification.measures(true.class = Y.test, pred.probs = test.predictions)
+
+          iter.res[[paste0("cvfold",ff)]][["train.perf"]] <- train.auc
+          iter.res[[paste0("cvfold",ff)]][["test.perf"]]  <- test.auc
+
+          perfs.mat[right.row,] <- c(rep, train.auc, test.auc)
+          print(perfs.mat[right.row,])
+          right.row = right.row+1
+
+          h2o.shutdown(FALSE)
+          Sys.sleep(2)
+    write.csv(perfs.mat, file = SAVE.CSV.FILE, quote = FALSE, row.names = FALSE)
+} #end ff
+     
+     time.in.mins = as.numeric(difftime(Sys.time(), start.time, units="mins"))
+     simul[[paste0("repetition",rep)]] = list(folds=iter.res, time.in.mins=time.in.mins)
+     
+     save(simul, file=SAVE.RDATA.FILE, compress="xz")
+} #end rep
+
+```
