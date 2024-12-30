@@ -11,11 +11,10 @@ El proyecto incluye:
 Este análisis está diseñado para:
 - Identificar biomarcadores transcriptómicos relevantes en el cáncer de riñón.
 - Evaluar el rendimiento de modelos predictivos en datos moleculares.
-- Generar reportes reproducibles con visualizaciones claras para facilitar la interpretación biológica.
 
 ## Contenido del Proyecto
 
-- **`tarea1.Rmd`**: Archivo principal en R Markdown que contiene el código y las instrucciones del análisis.
+- **`kidney_cancer_transcriptomics.Rmd`**: Archivo principal en R Markdown que contiene el código y las instrucciones del análisis.
 - **Dataset**: `KIPAN__illuminahiseq_rnaseqv2__Level_3__RSEM_genes_normalized.data.RData`, un conjunto de datos que proporciona perfiles transcriptómicos normalizados.
 - **Repeticiones y validación**:
   - REP.INIT = 1: Primera repetición de validación cruzada.
@@ -63,6 +62,4 @@ Este análisis está diseñado para:
 
 Este análisis permite explorar profundamente la expresión génica en diferentes tipos de cáncer de riñón. Los resultados pueden ayudar a identificar biomarcadores clave para diagnóstico, pronóstico y posibles dianas terapéuticas.
 
-## Licencia
-Este proyecto está bajo la licencia MIT. Consulta el archivo `LICENSE` para más información.
 
